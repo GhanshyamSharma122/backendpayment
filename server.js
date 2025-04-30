@@ -190,49 +190,85 @@ app.post('/api/payment/initiate', authenticateToken, async (req, res) => {
   }
 });
 
-// 4.4.1 Sync Offline Transactions
-app.post('/api/offline/sync', authenticateToken, async (req, res) => {
-  const { user_id, device_id, sync_timestamp, transactions } = req.body;
-  const synced = [];
-  const failed = [];
+// 5. Sync Offline Transactions and Update Balances
+app.post('/api/payment/sync', async (req, res) => {
+  const { transactions } = req.body;
 
-  for (const tx of transactions) {
-    try {
-      const insertResult = await pool.query(
-        `INSERT INTO offline_transactions (sender_user_id, receiver_identifier, amount, currency, offline_timestamp, encrypted_data)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING offline_transaction_id`,
-        [
-          user_id,
-          tx.recipient_identifier,
-          tx.amount,
-          tx.currency,
-          tx.timestamp,
-          tx.encrypted_data,
-        ]
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    for (const tx of transactions) {
+      const {
+        sender_id,
+        recipient_id,
+        amount,
+        currency,
+        timestamp,
+        status = 'SYNCED',
+        transaction_type = 'TRANSFER',
+        description = ''
+      } = tx;
+
+      const senderRes = await client.query(
+        'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [sender_id]
       );
-      synced.push({
-        local_transaction_id: tx.local_transaction_id,
-        server_transaction_id: insertResult.rows[0].offline_transaction_id,
-        status: 'SYNCED',
-      });
-    } catch (err) {
-      failed.push({
-        local_transaction_id: tx.local_transaction_id,
-        error: 'Sync failed',
-        reason: err.message,
-      });
-    }
-  }
+      const senderBalance = parseFloat(senderRes.rows[0]?.balance ?? 0);
+      if (senderBalance < amount) throw new Error(`Insufficient balance for user ${sender_id}`);
 
-  res.json({
-    sync_id: crypto.randomUUID(),
-    synced_transaction_details: synced,
-    failed_transactions: failed,
-    sync_completed_at: new Date().toISOString(),
-  });
+      const recipientRes = await client.query(
+        'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
+        [recipient_id]
+      );
+      if (recipientRes.rows.length === 0) throw new Error(`Recipient wallet not found for ${recipient_id}`);
+
+      await client.query(
+        'UPDATE wallets SET balance = balance - $1 WHERE user_id = $2',
+        [amount, sender_id]
+      );
+      await client.query(
+        'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
+        [amount, recipient_id]
+      );
+
+      await client.query(
+        `INSERT INTO transactions (
+          sender_user_id, receiver_user_id, amount, currency, status,
+          transaction_type, server_timestamp, description, created_at, updated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())`,
+        [sender_id, recipient_id, amount, currency, status, transaction_type, timestamp, description]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ message: 'Transactions synced and balances updated.' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: 'Sync failed', message: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-app.listen(port, () => {
-  console.log(`Gen Z Payment backend running at http://localhost:${port}`);
+// 6. Get All Transactions for a User
+app.get('/api/transactions/:userId', async (req, res) => {
+  const userId = req.params.userId;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM transactions
+       WHERE sender_user_id = $1 OR receiver_user_id = $1
+       ORDER BY server_timestamp DESC`,
+      [userId]
+    );
+
+    res.json({
+      user_id: userId,
+      transaction_count: result.rowCount,
+      transactions: result.rows
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to retrieve transactions', message: err.message });
+  }
 });
