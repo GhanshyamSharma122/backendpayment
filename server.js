@@ -1,214 +1,208 @@
+// server.js
 import express from 'express';
-import dotenv from 'dotenv';
 import pg from 'pg';
-import jwt from 'jsonwebtoken';
+import dotenv from 'dotenv';
 import bcrypt from 'bcrypt';
-import crypto from 'crypto';
-import cors from 'cors';
-
-dotenv.config();
+import jwt from 'jsonwebtoken';
+import { v4 as uuidv4 } from 'uuid';
 
 const { Pool } = pg;
+dotenv.config();
 
 const app = express();
 app.use(express.json());
-app.use(cors());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecret';
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret';
 
-// Authenticate Middleware
-function authenticate(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader) return res.status(401).json({ error: 'Missing token' });
-
-  const token = authHeader.split(' ')[1];
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid token' });
-    req.user = user;
-    next();
-  });
+function generateToken(userId) {
+  const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '24h' });
+  const expiry = new Date(Date.now() + 86400000).toISOString();
+  return { token, token_expiry: expiry };
 }
 
-// Register User
+async function authenticate(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.userId;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: 'Invalid token' });
+  }
+}
+
 app.post('/api/auth/register', async (req, res) => {
   const { username, email, password, phone_number, first_name, last_name, date_of_birth } = req.body;
+
   try {
-    const hashed = await bcrypt.hash(password, 10);
-    const result = await pool.query(`
-      INSERT INTO users (phone_number, email, hashed_password, created_at, updated_at)
-      VALUES ($1, $2, $3, NOW(), NOW())
-      RETURNING user_id, phone_number, email, created_at, updated_at
-    `, [phone_number, email, hashed]);
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-    const user = result.rows[0];
-    await pool.query(`INSERT INTO wallets (user_id, balance, created_at, updated_at) VALUES ($1, 0, NOW(), NOW())`, [user.user_id]);
+    const userId = uuidv4();
+    const now = new Date().toISOString();
 
-    const token = jwt.sign({ user_id: user.user_id }, JWT_SECRET, { expiresIn: '1h' });
+    await pool.query(`INSERT INTO users (user_id, username, email, phone_number, hashed_password, first_name, last_name, date_of_birth, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [userId, username, email, phone_number, hashedPassword, first_name, last_name, date_of_birth, now, now]);
 
-    res.status(201).json({
-      user: {
-        id: user.user_id,
-        username,
-        email: user.email,
-        phone_number: user.phone_number,
-        first_name,
-        last_name,
-        created_at: user.created_at,
-        updated_at: user.updated_at
-      },
+    await pool.query(`INSERT INTO wallets (wallet_id, user_id, balance, currency, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6)`,
+      [uuidv4(), userId, 1000.00, 'INR', now, now]);
+
+    const { token, token_expiry } = generateToken(userId);
+
+    return res.json({
+      user: { id: userId, username, email, phone_number, first_name, last_name, created_at: now, updated_at: now },
       token,
-      token_expiry: new Date(Date.now() + 3600000).toISOString()
+      token_expiry
     });
   } catch (err) {
-    console.error(err);
-    res.status(400).json({
-      error: 'Registration failed',
-      details: { field: 'unknown', message: err.message },
-      timestamp: new Date().toISOString()
-    });
+    return res.status(400).json({ error: 'Registration failed', details: err.message, timestamp: new Date().toISOString() });
   }
 });
 
-// Login User
 app.post('/api/auth/login', async (req, res) => {
   const { identifier, password } = req.body;
   try {
-    const result = await pool.query(
-      `SELECT * FROM users WHERE email = $1 OR phone_number = $1`,
-      [identifier]
-    );
-    const user = result.rows[0];
+    const userResult = await pool.query(`SELECT * FROM users WHERE username = $1 OR email = $1`, [identifier]);
+    const user = userResult.rows[0];
+
     if (!user || !(await bcrypt.compare(password, user.hashed_password))) {
-      return res.status(401).json({
-        error: 'Invalid credentials',
-        details: 'Username or password is incorrect',
-        timestamp: new Date().toISOString()
-      });
+      return res.status(401).json({ error: 'Invalid credentials', details: 'Incorrect username/email or password', timestamp: new Date().toISOString() });
     }
 
-    const token = jwt.sign({ user_id: user.user_id }, JWT_SECRET, { expiresIn: '1h' });
-    res.json({
+    const { token, token_expiry } = generateToken(user.user_id);
+
+    return res.json({
       user: {
         id: user.user_id,
-        username: identifier,
+        username: user.username,
         email: user.email,
         phone_number: user.phone_number
       },
       token,
-      token_expiry: new Date(Date.now() + 3600000).toISOString()
+      token_expiry
     });
   } catch (err) {
-    res.status(500).json({ error: 'Login failed', details: err.message });
+    return res.status(500).json({ error: 'Login failed', details: err.message });
   }
 });
 
-// Get Wallet Balance
 app.get('/api/wallet', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT * FROM wallets WHERE user_id = $1`,
-      [req.user.user_id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Wallet not found' });
-    }
-    res.json(result.rows[0]);
+    const result = await pool.query(`SELECT * FROM wallets WHERE user_id = $1`, [req.userId]);
+    return res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: 'Could not retrieve wallet', message: err.message });
+    return res.status(500).json({ error: 'Failed to retrieve wallet', message: err.message, status_code: 500 });
   }
 });
 
-// Initiate Payment
-app.post('/api/payment/initiate', async (req, res) => {
-  const {
-    sender_id,
-    recipient_id,
-    amount,
-    currency,
-    description,
-    transaction_type,
-    timestamp
-  } = req.body;
+app.post('/api/payment/initiate', authenticate, async (req, res) => {
+  const { recipient_id, amount, currency, description, transaction_type, timestamp } = req.body;
+  const sender_id = req.userId;
+  const now = new Date().toISOString();
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const senderRes = await client.query(
-      'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
-      [sender_id]
-    );
-    if (senderRes.rows.length === 0) throw new Error('Sender wallet not found');
-    const senderBalance = parseFloat(senderRes.rows[0].balance);
-    if (senderBalance < amount) throw new Error('Insufficient balance');
+    const senderBalance = await client.query(`SELECT balance FROM wallets WHERE user_id = $1`, [sender_id]);
+    if (parseFloat(senderBalance.rows[0].balance) < amount) throw new Error('Insufficient funds');
 
-    const recipientRes = await client.query(
-      'SELECT balance FROM wallets WHERE user_id = $1 FOR UPDATE',
-      [recipient_id]
-    );
-    if (recipientRes.rows.length === 0) throw new Error('Recipient wallet not found');
+    await client.query(`UPDATE wallets SET balance = balance - $1 WHERE user_id = $2`, [amount, sender_id]);
+    await client.query(`UPDATE wallets SET balance = balance + $1 WHERE user_id = $2`, [amount, recipient_id]);
 
-    await client.query(
-      'UPDATE wallets SET balance = balance - $1 WHERE user_id = $2',
-      [amount, sender_id]
-    );
-    await client.query(
-      'UPDATE wallets SET balance = balance + $1 WHERE user_id = $2',
-      [amount, recipient_id]
-    );
-
-    const result = await client.query(
-      `INSERT INTO transactions (sender_user_id, receiver_user_id, amount, currency, status, server_timestamp, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-       RETURNING transaction_id`,
-      [sender_id, recipient_id, amount, currency, 'SYNCED', timestamp || new Date().toISOString()]
-    );
+    const transaction_id = uuidv4();
+    await client.query(`INSERT INTO transactions (transaction_id, sender_user_id, receiver_user_id, amount, currency, status, server_timestamp, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, 'SYNCED', $6, $6, $6)`,
+      [transaction_id, sender_id, recipient_id, amount, currency, now]);
 
     await client.query('COMMIT');
 
-    res.json({
-      payment_id: result.rows[0].transaction_id,
+    return res.json({
+      payment_id: transaction_id,
       status: 'SYNCED',
-      sender_transaction_id: result.rows[0].transaction_id,
-      recipient_transaction_id: result.rows[0].transaction_id,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      sender_transaction_id: transaction_id,
+      recipient_transaction_id: transaction_id,
+      created_at: now,
+      updated_at: now
     });
-
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(400).json({
-      error: 'Transaction Failed',
-      message: err.message,
-      status_code: 400,
-      transaction_attempt_id: crypto.randomUUID(),
-      timestamp: new Date().toISOString()
-    });
+    return res.status(400).json({ error: 'Payment failed', message: err.message, status_code: 400, timestamp: new Date().toISOString() });
   } finally {
     client.release();
   }
 });
 
-// Get All Transactions by User ID
-app.get('/api/transactions/:userId', authenticate, async (req, res) => {
-  const { userId } = req.params;
+app.post('/api/offline/sync', authenticate, async (req, res) => {
+  const { device_id, transactions } = req.body;
+  const sender_id = req.userId;
+
+  const client = await pool.connect();
+  const now = new Date().toISOString();
+  const synced = [];
+  const failed = [];
+
   try {
-    const result = await pool.query(
-      `SELECT * FROM transactions WHERE sender_user_id = $1 OR receiver_user_id = $1 ORDER BY created_at DESC`,
-      [userId]
-    );
-    res.json(result.rows);
+    await client.query('BEGIN');
+
+    for (const tx of transactions) {
+      const exists = await client.query(`SELECT transaction_id FROM transactions WHERE encrypted_data = $1`, [tx.encrypted_data]);
+      if (exists.rows.length > 0) {
+        synced.push({ local_transaction_id: tx.local_transaction_id, server_transaction_id: exists.rows[0].transaction_id, status: 'ALREADY_SYNCED' });
+        continue;
+      }
+
+      const receiverResult = await client.query(`SELECT user_id FROM users WHERE username = $1 OR email = $1 OR phone_number = $1`, [tx.recipient_identifier]);
+      if (receiverResult.rows.length === 0) {
+        failed.push({ local_transaction_id: tx.local_transaction_id, error: 'Recipient not found', reason: 'No user with identifier' });
+        continue;
+      }
+
+      const receiver_id = receiverResult.rows[0].user_id;
+      const transaction_id = uuidv4();
+
+      const senderBalance = await client.query(`SELECT balance FROM wallets WHERE user_id = $1`, [sender_id]);
+      if (parseFloat(senderBalance.rows[0].balance) < tx.amount) {
+        failed.push({ local_transaction_id: tx.local_transaction_id, error: 'Insufficient funds', reason: 'Sender has insufficient balance' });
+        continue;
+      }
+
+      await client.query(`UPDATE wallets SET balance = balance - $1 WHERE user_id = $2`, [tx.amount, sender_id]);
+      await client.query(`UPDATE wallets SET balance = balance + $1 WHERE user_id = $2`, [tx.amount, receiver_id]);
+
+      await client.query(`INSERT INTO transactions (transaction_id, sender_user_id, receiver_user_id, amount, currency, status, server_timestamp, created_at, updated_at, encrypted_data)
+        VALUES ($1, $2, $3, $4, $5, 'SYNCED', $6, $6, $6, $7)`,
+        [transaction_id, sender_id, receiver_id, tx.amount, tx.currency, now, tx.encrypted_data]);
+
+      synced.push({ local_transaction_id: tx.local_transaction_id, server_transaction_id: transaction_id, status: 'SYNCED' });
+    }
+
+    await client.query('COMMIT');
+    return res.json({ sync_id: uuidv4(), synced_transaction_details: synced, failed_transactions: failed, sync_completed_at: new Date().toISOString() });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch transactions', message: err.message });
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'Sync failed', message: err.message });
+  } finally {
+    client.release();
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+app.get('/api/transactions', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM transactions WHERE sender_user_id = $1 OR receiver_user_id = $1 ORDER BY created_at DESC`, [req.userId]);
+    return res.json(result.rows);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to retrieve transactions', message: err.message });
+  }
 });
+
+app.listen(3000, () => console.log('Server running on port 3000'));
