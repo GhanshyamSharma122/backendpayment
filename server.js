@@ -305,6 +305,24 @@ app.get('/api/user/by-phone', authenticate, async (req, res) => {
     return res.status(500).json({ error: 'Failed to retrieve user', message: err.message });
   }
 });
+app.get('/api/user/:userId', authenticate, async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT user_id as id, username, first_name, last_name 
+       FROM users 
+       WHERE user_id = $1`,
+      [userId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    return res.json({ user: result.rows[0] }); // Keep consistency
+  } catch (err) {
+    console.error("Error fetching user by id:", err);
+    return res.status(500).json({ error: 'Failed to retrieve user details', message: err.message });
+  }
+});
 
 
 app.listen(3000, () => console.log('Server running on port 3000'));
