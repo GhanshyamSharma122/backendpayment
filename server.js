@@ -204,6 +204,73 @@ app.get('/api/transactions', authenticate, async (req, res) => {
     return res.status(500).json({ error: 'Failed to retrieve transactions', message: err.message });
   }
 });
+app.post('/api/contacts', authenticate, async (req, res) => {
+  const { name, phoneNumber } = req.body;
+  const owner_user_id = req.userId;
+
+  if (!name || !phoneNumber) {
+    return res.status(400).json({ error: 'Name and phone number are required.' });
+  }
+
+  try {
+    const newContactResult = await pool.query(
+      `INSERT INTO user_contacts (owner_user_id, contact_name, contact_phone_number)
+       VALUES ($1, $2, $3)
+       RETURNING id, contact_name, contact_phone_number, created_at`,
+      [owner_user_id, name, phoneNumber]
+    );
+    // The backend returns keys as per the table (contact_name, contact_phone_number)
+    // The Dart model will map these.
+    res.status(201).json(newContactResult.rows[0]);
+  } catch (err) {
+    if (err.constraint === 'unique_owner_contact_phone') {
+      return res.status(409).json({ error: 'Contact with this phone number already exists.' , details: err.message });
+    }
+    console.error('Error adding contact:', err);
+    return res.status(500).json({ error: 'Failed to add contact.', details: err.message });
+  }
+});
+
+// Get all contacts for the authenticated user
+app.get('/api/contacts', authenticate, async (req, res) => {
+  const owner_user_id = req.userId;
+  try {
+    const contactsResult = await pool.query(
+      `SELECT id, contact_name, contact_phone_number, created_at 
+       FROM user_contacts 
+       WHERE owner_user_id = $1 
+       ORDER BY contact_name ASC`,
+      [owner_user_id]
+    );
+    res.json(contactsResult.rows);
+  } catch (err) {
+    console.error('Error fetching contacts:', err);
+    return res.status(500).json({ error: 'Failed to retrieve contacts.', details: err.message });
+  }
+});
+
+// Delete a contact for the authenticated user
+app.delete('/api/contacts/:contactId', authenticate, async (req, res) => {
+  const { contactId } = req.params;
+  const owner_user_id = req.userId;
+
+  try {
+    const deleteResult = await pool.query(
+      `DELETE FROM user_contacts 
+       WHERE id = $1 AND owner_user_id = $2
+       RETURNING id`, // Optional: return ID to confirm deletion
+      [contactId, owner_user_id]
+    );
+
+    if (deleteResult.rowCount === 0) {
+      return res.status(404).json({ error: 'Contact not found or you do not have permission to delete it.' });
+    }
+    res.status(200).json({ message: 'Contact deleted successfully.', id: contactId }); // Or res.sendStatus(204) for No Content
+  } catch (err) {
+    console.error('Error deleting contact:', err);
+    return res.status(500).json({ error: 'Failed to delete contact.', details: err.message });
+  }
+});
 app.get('/api/user/by-phone', authenticate, async (req, res) => {
   const { phone_number } = req.query;
 
