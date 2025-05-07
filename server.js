@@ -280,8 +280,14 @@ app.get('/api/user/by-phone', authenticate, async (req, res) => {
 
   try {
     const result = await pool.query(
-      // Fetch all necessary fields
-      `SELECT user_id as id, username, first_name, last_name, email, phone_number as user_phone_number 
+      // Ensure you select all fields needed by PaymentScreen
+      `SELECT 
+         user_id AS id,         -- Aliased to 'id'
+         username, 
+         first_name, 
+         last_name, 
+         email, 
+         phone_number AS original_phone_number  -- original phone if needed
        FROM users 
        WHERE phone_number = $1`,
       [phone_number]
@@ -291,13 +297,11 @@ app.get('/api/user/by-phone', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Nest the user data under a "user" key
+    // THIS IS THE KEY CHANGE: Nest the result.rows[0] under a "user" key
     return res.json({ user: result.rows[0] }); 
-    // result.rows[0] will now be something like:
-    // { id: '...', username: '...', first_name: '...', last_name: '...', email: '...', user_phone_number: '...' }
 
   } catch (err) {
-    console.error("Error in /api/user/by-phone:", err); // Log the error for debugging
+    console.error("Error in /api/user/by-phone:", err); 
     return res.status(500).json({ error: 'Failed to retrieve user', message: err.message });
   }
 });
