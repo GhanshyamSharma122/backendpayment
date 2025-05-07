@@ -204,5 +204,28 @@ app.get('/api/transactions', authenticate, async (req, res) => {
     return res.status(500).json({ error: 'Failed to retrieve transactions', message: err.message });
   }
 });
+app.get('/api/user/by-phone', authenticate, async (req, res) => {
+  const { phone_number } = req.query;
+
+  if (!phone_number) {
+    return res.status(400).json({ error: 'Phone number is required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT user_id, username FROM users WHERE phone_number = $1`,
+      [phone_number]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    return res.json(result.rows[0]);
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to retrieve user', message: err.message });
+  }
+});
+
 
 app.listen(3000, () => console.log('Server running on port 3000'));
