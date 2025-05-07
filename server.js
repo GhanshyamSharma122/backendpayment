@@ -280,7 +280,10 @@ app.get('/api/user/by-phone', authenticate, async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT user_id, username FROM users WHERE phone_number = $1`,
+      // Fetch all necessary fields
+      `SELECT user_id as id, username, first_name, last_name, email, phone_number as user_phone_number 
+       FROM users 
+       WHERE phone_number = $1`,
       [phone_number]
     );
 
@@ -288,8 +291,13 @@ app.get('/api/user/by-phone', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    return res.json(result.rows[0]);
+    // Nest the user data under a "user" key
+    return res.json({ user: result.rows[0] }); 
+    // result.rows[0] will now be something like:
+    // { id: '...', username: '...', first_name: '...', last_name: '...', email: '...', user_phone_number: '...' }
+
   } catch (err) {
+    console.error("Error in /api/user/by-phone:", err); // Log the error for debugging
     return res.status(500).json({ error: 'Failed to retrieve user', message: err.message });
   }
 });
