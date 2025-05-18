@@ -195,6 +195,46 @@ app.post('/api/offline/sync', authenticate, async (req, res) => {
     client.release();
   }
 });
+app.post('/api/wallet/topup', authenticate, async (req, res) => {
+  const { amount, currency = 'INR' } = req.body;
+  const userId = req.userId;
+
+  if (!amount || isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'Invalid top-up amount' });
+  }
+
+  const now = new Date().toISOString();
+
+  try {
+    const result = await pool.query(
+      `UPDATE wallets 
+       SET balance = balance + $1, updated_at = $2 
+       WHERE user_id = $3 
+       RETURNING wallet_id, user_id, balance, currency, updated_at`,
+      [amount, now, userId]
+    );
+
+    // Optionally log the top-up as a transaction with a special type
+    const transactionId = uuidv4();
+    await pool.query(
+      `INSERT INTO transactions (
+         transaction_id, sender_user_id, receiver_user_id, amount, currency, status, server_timestamp, created_at, updated_at, transaction_type, description
+       )
+       VALUES ($1, NULL, $2, $3, $4, 'SYNCED', $5, $5, $5, 'TOP_UP', 'Wallet top-up')`,
+      [transactionId, userId, amount, currency, now]
+    );
+
+    return res.status(200).json({
+      message: 'Balance topped up successfully',
+      wallet: result.rows[0],
+      transaction_id: transactionId,
+      updated_at: now
+    });
+  } catch (err) {
+    console.error('Top-up failed:', err);
+    return res.status(500).json({ error: 'Failed to top up wallet', message: err.message });
+  }
+});
 
 app.get('/api/transactions', authenticate, async (req, res) => {
   try {
