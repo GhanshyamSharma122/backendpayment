@@ -1,4 +1,3 @@
-// server.js
 import express from 'express';
 import pg from 'pg';
 import dotenv from 'dotenv';
@@ -120,9 +119,13 @@ app.post('/api/payment/initiate', authenticate, async (req, res) => {
     await client.query(`UPDATE wallets SET balance = balance + $1 WHERE user_id = $2`, [amount, recipient_id]);
 
     const transaction_id = uuidv4();
-    await client.query(`INSERT INTO transactions (transaction_id, sender_user_id, receiver_user_id, amount, currency, status, server_timestamp, created_at, updated_at)
-      VALUES ($1, $2, $3, $4, $5, 'SYNCED', $6, $6, $6)`,
-      [transaction_id, sender_id, recipient_id, amount, currency, now]);
+    await client.query(
+      `INSERT INTO transactions (
+         transaction_id, sender_user_id, receiver_user_id, amount, currency, status, server_timestamp, created_at, updated_at, transaction_type, description
+       )
+       VALUES ($1, $2, $3, $4, $5, 'SYNCED', $6, $6, $6, $7, $8)`,
+      [transaction_id, sender_id, recipient_id, amount, currency, now, transaction_type || 'TRANSFER', description || '']
+    );
 
     await client.query('COMMIT');
 
@@ -142,59 +145,6 @@ app.post('/api/payment/initiate', authenticate, async (req, res) => {
   }
 });
 
-app.post('/api/offline/sync', authenticate, async (req, res) => {
-  const { device_id, transactions } = req.body;
-  const sender_id = req.userId;
-
-  const client = await pool.connect();
-  const now = new Date().toISOString();
-  const synced = [];
-  const failed = [];
-
-  try {
-    await client.query('BEGIN');
-
-    for (const tx of transactions) {
-      const exists = await client.query(`SELECT transaction_id FROM transactions WHERE encrypted_data = $1`, [tx.encrypted_data]);
-      if (exists.rows.length > 0) {
-        synced.push({ local_transaction_id: tx.local_transaction_id, server_transaction_id: exists.rows[0].transaction_id, status: 'ALREADY_SYNCED' });
-        continue;
-      }
-
-      const receiverResult = await client.query(`SELECT user_id FROM users WHERE username = $1 OR email = $1 OR phone_number = $1`, [tx.recipient_identifier]);
-      if (receiverResult.rows.length === 0) {
-        failed.push({ local_transaction_id: tx.local_transaction_id, error: 'Recipient not found', reason: 'No user with identifier' });
-        continue;
-      }
-
-      const receiver_id = receiverResult.rows[0].user_id;
-      const transaction_id = uuidv4();
-
-      const senderBalance = await client.query(`SELECT balance FROM wallets WHERE user_id = $1`, [sender_id]);
-      if (parseFloat(senderBalance.rows[0].balance) < tx.amount) {
-        failed.push({ local_transaction_id: tx.local_transaction_id, error: 'Insufficient funds', reason: 'Sender has insufficient balance' });
-        continue;
-      }
-
-      await client.query(`UPDATE wallets SET balance = balance - $1 WHERE user_id = $2`, [tx.amount, sender_id]);
-      await client.query(`UPDATE wallets SET balance = balance + $1 WHERE user_id = $2`, [tx.amount, receiver_id]);
-
-      await client.query(`INSERT INTO transactions (transaction_id, sender_user_id, receiver_user_id, amount, currency, status, server_timestamp, created_at, updated_at, encrypted_data)
-        VALUES ($1, $2, $3, $4, $5, 'SYNCED', $6, $6, $6, $7)`,
-        [transaction_id, sender_id, receiver_id, tx.amount, tx.currency, now, tx.encrypted_data]);
-
-      synced.push({ local_transaction_id: tx.local_transaction_id, server_transaction_id: transaction_id, status: 'SYNCED' });
-    }
-
-    await client.query('COMMIT');
-    return res.json({ sync_id: uuidv4(), synced_transaction_details: synced, failed_transactions: failed, sync_completed_at: new Date().toISOString() });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    return res.status(500).json({ error: 'Sync failed', message: err.message });
-  } finally {
-    client.release();
-  }
-});
 app.post('/api/wallet/topup', authenticate, async (req, res) => {
   const { amount, currency = 'INR' } = req.body;
   const userId = req.userId;
@@ -214,7 +164,6 @@ app.post('/api/wallet/topup', authenticate, async (req, res) => {
       [amount, now, userId]
     );
 
-    // Optionally log the top-up as a transaction with a special type
     const transactionId = uuidv4();
     await pool.query(
       `INSERT INTO transactions (
@@ -244,6 +193,7 @@ app.get('/api/transactions', authenticate, async (req, res) => {
     return res.status(500).json({ error: 'Failed to retrieve transactions', message: err.message });
   }
 });
+
 app.post('/api/contacts', authenticate, async (req, res) => {
   const { name, phoneNumber } = req.body;
   const owner_user_id = req.userId;
@@ -259,19 +209,16 @@ app.post('/api/contacts', authenticate, async (req, res) => {
        RETURNING id, contact_name, contact_phone_number, created_at`,
       [owner_user_id, name, phoneNumber]
     );
-    // The backend returns keys as per the table (contact_name, contact_phone_number)
-    // The Dart model will map these.
     res.status(201).json(newContactResult.rows[0]);
   } catch (err) {
     if (err.constraint === 'unique_owner_contact_phone') {
-      return res.status(409).json({ error: 'Contact with this phone number already exists.' , details: err.message });
+      return res.status(409).json({ error: 'Contact with this phone number already exists.', details: err.message });
     }
     console.error('Error adding contact:', err);
     return res.status(500).json({ error: 'Failed to add contact.', details: err.message });
   }
 });
 
-// Get all contacts for the authenticated user
 app.get('/api/contacts', authenticate, async (req, res) => {
   const owner_user_id = req.userId;
   try {
@@ -289,7 +236,6 @@ app.get('/api/contacts', authenticate, async (req, res) => {
   }
 });
 
-// Delete a contact for the authenticated user
 app.delete('/api/contacts/:contactId', authenticate, async (req, res) => {
   const { contactId } = req.params;
   const owner_user_id = req.userId;
@@ -298,19 +244,20 @@ app.delete('/api/contacts/:contactId', authenticate, async (req, res) => {
     const deleteResult = await pool.query(
       `DELETE FROM user_contacts 
        WHERE id = $1 AND owner_user_id = $2
-       RETURNING id`, // Optional: return ID to confirm deletion
+       RETURNING id`,
       [contactId, owner_user_id]
     );
 
     if (deleteResult.rowCount === 0) {
       return res.status(404).json({ error: 'Contact not found or you do not have permission to delete it.' });
     }
-    res.status(200).json({ message: 'Contact deleted successfully.', id: contactId }); // Or res.sendStatus(204) for No Content
+    res.status(200).json({ message: 'Contact deleted successfully.', id: contactId });
   } catch (err) {
     console.error('Error deleting contact:', err);
     return res.status(500).json({ error: 'Failed to delete contact.', details: err.message });
   }
 });
+
 app.get('/api/user/by-phone', authenticate, async (req, res) => {
   const { phone_number } = req.query;
 
@@ -320,14 +267,13 @@ app.get('/api/user/by-phone', authenticate, async (req, res) => {
 
   try {
     const result = await pool.query(
-      // Ensure you select all fields needed by PaymentScreen
       `SELECT 
-         user_id AS id,         -- Aliased to 'id'
+         user_id AS id,
          username, 
          first_name, 
          last_name, 
          email, 
-         phone_number AS original_phone_number  -- original phone if needed
+         phone_number AS original_phone_number
        FROM users 
        WHERE phone_number = $1`,
       [phone_number]
@@ -337,14 +283,13 @@ app.get('/api/user/by-phone', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // THIS IS THE KEY CHANGE: Nest the result.rows[0] under a "user" key
-    return res.json({ user: result.rows[0] }); 
-
+    return res.json({ user: result.rows[0] });
   } catch (err) {
-    console.error("Error in /api/user/by-phone:", err); 
+    console.error("Error in /api/user/by-phone:", err);
     return res.status(500).json({ error: 'Failed to retrieve user', message: err.message });
   }
 });
+
 app.get('/api/user/:userId', authenticate, async (req, res) => {
   const { userId } = req.params;
   try {
@@ -357,12 +302,11 @@ app.get('/api/user/:userId', authenticate, async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
-    return res.json({ user: result.rows[0] }); // Keep consistency
+    return res.json({ user: result.rows[0] });
   } catch (err) {
     console.error("Error fetching user by id:", err);
     return res.status(500).json({ error: 'Failed to retrieve user details', message: err.message });
   }
 });
-
 
 app.listen(3000, () => console.log('Server running on port 3000'));
